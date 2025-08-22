@@ -40,6 +40,7 @@ uint8_t  lastStatus     = 0;
 uint16_t lastFlowX100   = 0;
 uint16_t lastHzX10      = 0;
 uint16_t lastUltraCm    = 0;
+bool     lastHasUltra   = false;   // indica si el esclavo envió ultrasonido en el último reporte
 
 // Cache de líneas LCD
 String lineCache[LCD_ROWS] = {"", "", "", ""};
@@ -64,6 +65,7 @@ bool readSlaveReportFlexible(uint8_t addr,
                              uint16_t &ultraCm,
                              bool &hasUltra);
 bool sendRelay(uint8_t addr, uint8_t onOff);
+void refreshFromSlaveNow();
 
 // ================== Util ==================
 static inline int median3(int a, int b, int c) {
@@ -188,6 +190,7 @@ void loop() {
         lastFlowX100 = fx100;
         lastHzX10    = hz10;
         if (hasU) lastUltraCm = ucm;
+        lastHasUltra = hasU;   // guardar si hubo ultrasonido
 
         char l0[21];
         snprintf(l0, sizeof(l0), "%s (0x%02X)", currentName(), currentAddr());
@@ -218,6 +221,7 @@ void loop() {
         printLineFixed(3, "Corto:ON/OFF Largo:Menu");
       } else {
         haveLastReport = false;
+        lastHasUltra = false;
         printLineFixed(1, "Sin respuesta I2C   ");
         printLineFixed(2, "                    ");
         printLineFixed(3, "Largo:Menu          ");
@@ -243,16 +247,59 @@ void showMenu() {
 
 void showProjectScreen() {
   clearCacheAndLCD();
-  char l0[21]; snprintf(l0, sizeof(l0), "%s (0x%02X)", currentName(), currentAddr()); printLineFixed(0, l0);
-  printLineFixed(1, "R:-- Hz:--.- U:---");
-  printLineFixed(2, "F:--.-- L/m        ");
+
+  // Encabezado con nombre + dirección
+  char l0[21];
+  snprintf(l0, sizeof(l0), "%s (0x%02X)", currentName(), currentAddr());
+  printLineFixed(0, l0);
+
+  // Si ya tenemos una lectura previa, la mostramos; si no, placeholders.
+  if (haveLastReport) {
+    // Línea 1: R:ON/OFF  Hz:x.x  [U:xxx si hay ultrasonido]
+    if (lastHasUltra) {
+      char l1[21];
+      snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u U:%u",
+               (lastStatus & 0x01) ? "ON " : "OFF",
+               (unsigned)(lastHzX10/10), (unsigned)(lastHzX10%10),
+               (unsigned)lastUltraCm);
+      printLineFixed(1, l1);
+    } else {
+      char l1[21];
+      snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u       ",
+               (lastStatus & 0x01) ? "ON " : "OFF",
+               (unsigned)(lastHzX10/10), (unsigned)(lastHzX10%10));
+      printLineFixed(1, l1);
+    }
+
+    // Línea 2: F:xx.xx L/m
+    char l2[21];
+    snprintf(l2, sizeof(l2), "F:%2u.%02u L/m       ",
+             (unsigned)(lastFlowX100/100), (unsigned)(lastFlowX100%100));
+    printLineFixed(2, l2);
+  } else {
+    // Aún no hay datos
+    printLineFixed(1, "R:-- Hz:--.- U:---");
+    printLineFixed(2, "F:--.-- L/m        ");
+  }
+
+  // Línea 3: ayuda de controles
   printLineFixed(3, "Corto:ON/OFF Largo:Menu");
 }
 
 void enterProject(int index) {
   (void)index;
-  inMenu = false; haveLastReport = false; lastReadAt = 0;
+  inMenu = false;
+  haveLastReport = false;
+  lastHasUltra = false;
+
+  // Hacer una lectura inmediata para que la pantalla ya salga con datos reales
+  refreshFromSlaveNow();
+
+  // Ahora dibuja la pantalla (ya usará valores si existen)
   showProjectScreen();
+
+  // Forzar próximo refresco periódico sin esperar todo el intervalo
+  lastReadAt = millis();  // o 0 si prefieres que refresque de inmediato en loop
 }
 
 void exitProject(bool forceOff) {
@@ -324,4 +371,19 @@ bool sendRelay(uint8_t addr, uint8_t onOff) {
     return false;
   }
   return true;
+}
+
+void refreshFromSlaveNow() {
+  uint8_t st; uint16_t fx100, hz10, ucm; bool hasU;
+  if (readSlaveReportFlexible(currentAddr(), st, fx100, hz10, ucm, hasU)) {
+    haveLastReport = true;
+    lastStatus   = st;
+    lastFlowX100 = fx100;
+    lastHzX10    = hz10;
+    if (hasU) lastUltraCm = ucm;
+    lastHasUltra = hasU;
+  } else {
+    haveLastReport = false;
+    lastHasUltra = false;
+  }
 }
