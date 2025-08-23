@@ -1,73 +1,55 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// ================== Direcciones I2C de esclavos ==================
+/* ================== Direcciones I2C ================== */
 const uint8_t DEV_ADDRS[]  = { 0x0C, 0x08, 0x09, 0x0A, 0x0B };
 const char*   DEV_NAMES[]  = { "Entrada", "Casa 1", "Casa 2", "Casa 3", "Deposito" };
-const int NUM_DEVICES = sizeof(DEV_ADDRS) / sizeof(DEV_ADDRS[0]);
+const uint8_t NUM_DEVICES  = sizeof(DEV_ADDRS) / sizeof(DEV_ADDRS[0]);
 
-// ================== LCD (20x4) ==================
-LiquidCrystal_I2C lcd(0x27, 20, 4);   // cambia 0x27 → 0x3F si tu módulo lo requiere
+/* ================== LCD (20x4) ================== */
+LiquidCrystal_I2C lcd(0x27, 20, 4);  // Cambia a 0x3F si tu backpack lo requiere
 static const uint8_t LCD_COLS = 20;
 static const uint8_t LCD_ROWS = 4;
 
-// ================== Joystick ==================
-const int yAxisPin  = A1;   // eje Y del joystick
-const int buttonPin = 6;    // botón del joystick (a GND) con INPUT_PULLUP
+/* ================== Joystick ================== */
+const uint8_t Y_AXIS_PIN = A1;    // eje Y
+const uint8_t BTN_PIN    = 6;     // botón (a GND), usar INPUT_PULLUP
 
-// Umbrales/histeresis del eje Y
+// Umbrales eje Y (ajústalos si tu joystick da otros rangos)
 const int Y_LOW_THRESH   = 350;
 const int Y_HIGH_THRESH  = 700;
 const int Y_CENTER_MIN   = 450;
 const int Y_CENTER_MAX   = 600;
 
-// ================== Estado UI ==================
-bool inMenu = true;
-int  menuIndex = 0;
+/* ================== Estado UI ================== */
+bool inMenu     = true;
+int  menuIndex  = 0;
 
-// Botón corto/largo
-bool btnPrev = HIGH;
+bool btnPrev    = HIGH;
 unsigned long btnDownAt = 0;
-const unsigned long LONG_PRESS_MS = 1200;
+const unsigned long LONG_PRESS_MS = 1000;
 
-// ================== Lectura periódica esclavo ==================
-unsigned long lastReadAt = 0;
-const unsigned long READ_EVERY_MS = 500;
+/* ================== Poll I2C ================== */
+unsigned long lastPollMs = 0;
+const unsigned long POLL_EVERY_MS = 300;   // 300 ms = suave
+const uint8_t REPORT_SIZE = 8;
 
-// Último estado leído del esclavo seleccionado
-bool     haveLastReport = false;
-uint8_t  lastStatus     = 0;
-uint16_t lastFlowX100   = 0;
-uint16_t lastHzX10      = 0;
-uint16_t lastUltraCm    = 0;
-bool     lastHasUltra   = false;   // indica si el esclavo envió ultrasonido en el último reporte
+/* ================== Último reporte ================== */
+bool     haveReport   = false;
+uint8_t  lastStatus   = 0;       // bit0 = relé
+uint16_t lastFlowX100 = 0;       // L/min * 100
+uint16_t lastHzX10    = 0;       // Hz * 10
+uint16_t lastUltraCm  = 0;       // cm
+bool     lastHasUltra = false;
 
-// Cache de líneas LCD
-String lineCache[LCD_ROWS] = {"", "", "", ""};
-
-// ================== Navegación con autorepeat ==================
+/* ================== Autorepeat navegación ================== */
 enum NavState { NAV_CENTER, NAV_UP, NAV_DOWN };
 NavState navState = NAV_CENTER;
-unsigned long navLastStepAt = 0;
-unsigned long navStateSince = 0;
+unsigned long navSince = 0, navLastStep = 0;
 const unsigned long NAV_INITIAL_DELAY   = 350;
-const unsigned long NAV_REPEAT_INTERVAL = 220;
+const unsigned long NAV_REPEAT_INTERVAL = 200;
 
-// ================== Prototipos ==================
-void showMenu();
-void showProjectScreen();
-void enterProject(int index);
-void exitProject(bool forceOff);
-bool readSlaveReportFlexible(uint8_t addr,
-                             uint8_t &status,
-                             uint16_t &flowX100,
-                             uint16_t &hzX10,
-                             uint16_t &ultraCm,
-                             bool &hasUltra);
-bool sendRelay(uint8_t addr, uint8_t onOff);
-void refreshFromSlaveNow();
-
-// ================== Util ==================
+/* ================== Utiles ================== */
 static inline int median3(int a, int b, int c) {
   if (a > b) { int t=a; a=b; b=t; }
   if (b > c) { int t=b; b=c; c=t; }
@@ -76,314 +58,304 @@ static inline int median3(int a, int b, int c) {
 }
 
 int readYAxisStable() {
-  int a = analogRead(yAxisPin);
-  delayMicroseconds(200);
-  int b = analogRead(yAxisPin);
-  delayMicroseconds(200);
-  int c = analogRead(yAxisPin);
+  int a = analogRead(Y_AXIS_PIN);
+  delayMicroseconds(150);
+  int b = analogRead(Y_AXIS_PIN);
+  delayMicroseconds(150);
+  int c = analogRead(Y_AXIS_PIN);
   return median3(a,b,c);
-}
-
-void printLineFixed(uint8_t row, const char* cstr) {
-  char buf[21];
-  uint8_t i = 0;
-  for (; i < LCD_COLS && cstr[i] != '\0'; ++i) buf[i] = cstr[i];
-  for (; i < LCD_COLS; ++i) buf[i] = ' ';
-  buf[LCD_COLS] = '\0';
-
-  String s(buf);
-  if (row < LCD_ROWS && s != lineCache[row]) {
-    lineCache[row] = s;
-    lcd.setCursor(0, row);
-    lcd.print(s);
-  }
-}
-
-void clearCacheAndLCD() {
-  for (uint8_t r = 0; r < LCD_ROWS; ++r) lineCache[r] = "";
-  lcd.clear();
 }
 
 uint8_t currentAddr()    { return DEV_ADDRS[menuIndex]; }
 const char* currentName(){ return DEV_NAMES[menuIndex]; }
 
-// ================== Setup ==================
-void setup() {
-  lcd.init();
-  lcd.backlight();
-  clearCacheAndLCD();
-  showMenu();
+/* =============== Dibujo seguro al LCD (sin String) =============== */
+char lineCache[LCD_ROWS][LCD_COLS + 1]; // cache por fila
 
-  pinMode(buttonPin, INPUT_PULLUP);
-
-  Wire.begin();           // UNO como maestro
-  Wire.setClock(100000);  // 100 kHz (sube a 400k si todo lo soporta)
-  Wire.setTimeout(20);    // 20 ms timeout I2C
-
-  Serial.begin(9600);
-  delay(50);
-}
-
-// ================== Loop ==================
-void loop() {
-  int yValue = readYAxisStable();
-
-  // Botón corto/largo
-  bool btnNow = digitalRead(buttonPin);
-  if (btnPrev == HIGH && btnNow == LOW) { btnDownAt = millis(); }
-  if (btnPrev == LOW && btnNow == HIGH) {
-    unsigned long held = millis() - btnDownAt;
-    if (inMenu) {
-      if (held >= 10) enterProject(menuIndex);
-    } else {
-      if (held >= LONG_PRESS_MS) {
-        exitProject(true); // apaga y regresa al menú
-      } else {
-        // Toggle relé del esclavo actual
-        uint8_t addr = currentAddr();
-        uint8_t desired = haveLastReport ? ((lastStatus & 0x01) ? 0 : 1) : 1;
-        if (!sendRelay(addr, desired)) {
-          printLineFixed(2, "I2C error al enviar ");
-        }
-      }
-    }
-  }
-  btnPrev = btnNow;
-
-  // Menú con autorepeat por eje Y
-  if (inMenu) {
-    unsigned long now = millis();
-    NavState newState;
-    if (yValue >= Y_CENTER_MIN && yValue <= Y_CENTER_MAX) newState = NAV_CENTER;
-    else if (yValue < Y_LOW_THRESH)                       newState = NAV_UP;   // arriba
-    else if (yValue > Y_HIGH_THRESH)                      newState = NAV_DOWN; // abajo
-    else                                                  newState = navState;
-
-    if (newState != navState) {
-      navState = newState;
-      navStateSince = now;
-      navLastStepAt = 0;
-      if (navState == NAV_UP || navState == NAV_DOWN) {
-        int dir = (navState == NAV_UP) ? +1 : -1; // invertido para tu joystick
-        menuIndex = (menuIndex + (dir > 0 ? 1 : -1) + NUM_DEVICES) % NUM_DEVICES;
-        navLastStepAt = now;
-        showMenu();
-      }
-    } else if (navState == NAV_UP || navState == NAV_DOWN) {
-      if ((now - navStateSince) >= NAV_INITIAL_DELAY &&
-          (now - navLastStepAt)  >= NAV_REPEAT_INTERVAL) {
-        int dir = (navState == NAV_UP) ? +1 : -1;
-        menuIndex = (menuIndex + (dir > 0 ? 1 : -1) + NUM_DEVICES) % NUM_DEVICES;
-        navLastStepAt = now;
-        showMenu();
-      }
-    }
-  } else {
-    // pantalla de proyecto: refrescar datos del esclavo
-    if (millis() - lastReadAt >= READ_EVERY_MS) {
-      lastReadAt = millis();
-
-      uint8_t st; uint16_t fx100, hz10, ucm; bool hasU;
-      if (readSlaveReportFlexible(currentAddr(), st, fx100, hz10, ucm, hasU)) {
-        haveLastReport = true;
-        lastStatus   = st;
-        lastFlowX100 = fx100;
-        lastHzX10    = hz10;
-        if (hasU) lastUltraCm = ucm;
-        lastHasUltra = hasU;   // guardar si hubo ultrasonido
-
-        char l0[21];
-        snprintf(l0, sizeof(l0), "%s (0x%02X)", currentName(), currentAddr());
-        printLineFixed(0, l0);
-
-        // Línea 1: R:ON/OFF  Hz:x.x  U:xxx (solo si hay U)
-        if (hasU) {
-          char l1[21];
-          snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u U:%u",
-                   (st & 0x01) ? "ON " : "OFF",
-                   (unsigned)(hz10/10), (unsigned)(hz10%10),
-                   (unsigned)lastUltraCm);
-          printLineFixed(1, l1);
-        } else {
-          char l1[21];
-          snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u       ",
-                   (st & 0x01) ? "ON " : "OFF",
-                   (unsigned)(hz10/10), (unsigned)(hz10%10));
-          printLineFixed(1, l1);
-        }
-
-        // Línea 2: F:xx.xx L/m
-        char l2[21];
-        snprintf(l2, sizeof(l2), "F:%2u.%02u L/m",
-                 (unsigned)(fx100/100), (unsigned)(fx100%100));
-        printLineFixed(2, l2);
-
-        printLineFixed(3, "Corto:ON/OFF Largo:Menu");
-      } else {
-        haveLastReport = false;
-        lastHasUltra = false;
-        printLineFixed(1, "Sin respuesta I2C   ");
-        printLineFixed(2, "                    ");
-        printLineFixed(3, "Largo:Menu          ");
-        Serial.print(F("No responde addr 0x")); Serial.println(currentAddr(), HEX);
-      }
-    }
-  }
-
-  delay(10);
-}
-
-// ================== UI ==================
-void showMenu() {
-  clearCacheAndLCD();
-  printLineFixed(0, "Menu:");
-  for (int i = 0; i < 3; i++) {
-    int idx = (menuIndex + i) % NUM_DEVICES;
-    char l[21];
-    snprintf(l, sizeof(l), "%c%s", (i==0 ? '>' : ' '), DEV_NAMES[idx]);
-    printLineFixed(i+1, l);
+void lcdPrintLine(uint8_t row, const char* src) {
+  if (row >= LCD_ROWS) return;
+  char buf[LCD_COLS+1];
+  uint8_t i=0; 
+  for (; i < LCD_COLS && src[i]; ++i) buf[i] = src[i];
+  for (; i < LCD_COLS; ++i) buf[i] = ' ';
+  buf[LCD_COLS] = '\0';
+  if (strncmp(buf, lineCache[row], LCD_COLS) != 0) {
+    memcpy(lineCache[row], buf, LCD_COLS+1);
+    lcd.setCursor(0, row);
+    lcd.print(buf);
   }
 }
 
-void showProjectScreen() {
-  clearCacheAndLCD();
-
-  // Encabezado con nombre + dirección
-  char l0[21];
-  snprintf(l0, sizeof(l0), "%s (0x%02X)", currentName(), currentAddr());
-  printLineFixed(0, l0);
-
-  // Si ya tenemos una lectura previa, la mostramos; si no, placeholders.
-  if (haveLastReport) {
-    // Línea 1: R:ON/OFF  Hz:x.x  [U:xxx si hay ultrasonido]
-    if (lastHasUltra) {
-      char l1[21];
-      snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u U:%u",
-               (lastStatus & 0x01) ? "ON " : "OFF",
-               (unsigned)(lastHzX10/10), (unsigned)(lastHzX10%10),
-               (unsigned)lastUltraCm);
-      printLineFixed(1, l1);
-    } else {
-      char l1[21];
-      snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u       ",
-               (lastStatus & 0x01) ? "ON " : "OFF",
-               (unsigned)(lastHzX10/10), (unsigned)(lastHzX10%10));
-      printLineFixed(1, l1);
-    }
-
-    // Línea 2: F:xx.xx L/m
-    char l2[21];
-    snprintf(l2, sizeof(l2), "F:%2u.%02u L/m       ",
-             (unsigned)(lastFlowX100/100), (unsigned)(lastFlowX100%100));
-    printLineFixed(2, l2);
-  } else {
-    // Aún no hay datos
-    printLineFixed(1, "R:-- Hz:--.- U:---");
-    printLineFixed(2, "F:--.-- L/m        ");
+void lcdClearCache() {
+  for (uint8_t r=0;r<LCD_ROWS;++r) {
+    for (uint8_t c=0;c<LCD_COLS;++c) lineCache[r][c] = '\0';
+    lineCache[r][LCD_COLS] = '\0';
   }
-
-  // Línea 3: ayuda de controles
-  printLineFixed(3, "Corto:ON/OFF Largo:Menu");
+  lcd.clear();
 }
 
-void enterProject(int index) {
-  (void)index;
-  inMenu = false;
-  haveLastReport = false;
-  lastHasUltra = false;
-
-  // Hacer una lectura inmediata para que la pantalla ya salga con datos reales
-  refreshFromSlaveNow();
-
-  // Ahora dibuja la pantalla (ya usará valores si existen)
-  showProjectScreen();
-
-  // Forzar próximo refresco periódico sin esperar todo el intervalo
-  lastReadAt = millis();  // o 0 si prefieres que refresque de inmediato en loop
-}
-
-void exitProject(bool forceOff) {
-  if (forceOff) sendRelay(currentAddr(), 0);
-  inMenu = true; showMenu();
-}
-
-// ================== I2C helpers ==================
-// Intenta 8 bytes (status,res,flowL,flowH,hzL,hzH,ultraL,ultraH)
-// Si falla, intenta 6 bytes (status,res,flowL,flowH,hzL,hzH)
-bool readSlaveReportFlexible(uint8_t addr,
-                             uint8_t &status,
-                             uint16_t &flowX100,
-                             uint16_t &hzX10,
-                             uint16_t &ultraCm,
-                             bool &hasUltra) {
+/* ================== I2C robusto ================== */
+// Devuelve true si pudo leer 8 bytes. Si lee 6 bytes, deja hasUltra=false.
+bool readReport(uint8_t addr,
+                uint8_t &status,
+                uint16_t &flowX100,
+                uint16_t &hzX10,
+                uint16_t &ultraCm,
+                bool &hasUltra)
+{
   hasUltra = false;
 
-  // Intento 8 bytes
+  // Pequeña separación para que el backpack del LCD no “acapare” el bus
+  delayMicroseconds(200);
+
+  // Intento #1: 8 bytes
   {
-    const uint8_t N = 8;
-    uint8_t got = Wire.requestFrom((uint8_t)addr, (uint8_t)N);
-    if (got == N && Wire.available() >= N) {
-      uint8_t b0 = Wire.read();
-      (void)Wire.read(); // reservado
+    Wire.requestFrom((uint8_t)addr, (uint8_t)8, (uint8_t)true);
+    uint8_t got = Wire.available();
+    if (got == 8) {
+      uint8_t b0 = Wire.read(); (void)Wire.read();
       uint8_t fL = Wire.read(), fH = Wire.read();
       uint8_t hL = Wire.read(), hH = Wire.read();
       uint8_t uL = Wire.read(), uH = Wire.read();
-
       status   = b0;
       flowX100 = (uint16_t)fL | ((uint16_t)fH << 8);
       hzX10    = (uint16_t)hL | ((uint16_t)hH << 8);
       ultraCm  = (uint16_t)uL | ((uint16_t)uH << 8);
       hasUltra = true;
+      // Limpieza por si quedaron bytes (no debería)
+      while (Wire.available()) (void)Wire.read();
       return true;
+    } else {
+      // Vaciar lo que haya
+      while (Wire.available()) (void)Wire.read();
     }
   }
 
-  // Intento 6 bytes
+  // Intento #2: 6 bytes
   {
-    const uint8_t N = 6;
-    uint8_t got = Wire.requestFrom((uint8_t)addr, (uint8_t)N);
-    if (got == N && Wire.available() >= N) {
-      uint8_t b0 = Wire.read();
-      (void)Wire.read(); // reservado
+    Wire.requestFrom((uint8_t)addr, (uint8_t)6, (uint8_t)true);
+    uint8_t got = Wire.available();
+    if (got == 6) {
+      uint8_t b0 = Wire.read(); (void)Wire.read();
       uint8_t fL = Wire.read(), fH = Wire.read();
       uint8_t hL = Wire.read(), hH = Wire.read();
-
       status   = b0;
       flowX100 = (uint16_t)fL | ((uint16_t)fH << 8);
       hzX10    = (uint16_t)hL | ((uint16_t)hH << 8);
       ultraCm  = 0;
       hasUltra = false;
+      while (Wire.available()) (void)Wire.read();
       return true;
+    } else {
+      while (Wire.available()) (void)Wire.read();
     }
   }
 
   return false;
 }
 
-bool sendRelay(uint8_t addr, uint8_t onOff) {
+bool sendRelay(uint8_t addr, bool on) {
+  // Separación para no colisionar con el LCD en el bus
+  delayMicroseconds(200);
+
   Wire.beginTransmission(addr);
-  Wire.write(onOff ? 1 : 0);
-  uint8_t err = Wire.endTransmission();
+  Wire.write(on ? 1 : 0);
+  uint8_t err = Wire.endTransmission(true);
   if (err != 0) {
-    Serial.print(F("I2C endTransmission error="));
-    Serial.print(err);
-    Serial.print(F(" to 0x")); Serial.println(addr, HEX);
+    Serial.print(F("I2C endTransmission err=")); Serial.print(err);
+    Serial.print(F(" addr=0x")); Serial.println(addr, HEX);
     return false;
   }
   return true;
 }
 
-void refreshFromSlaveNow() {
-  uint8_t st; uint16_t fx100, hz10, ucm; bool hasU;
-  if (readSlaveReportFlexible(currentAddr(), st, fx100, hz10, ucm, hasU)) {
-    haveLastReport = true;
-    lastStatus   = st;
-    lastFlowX100 = fx100;
-    lastHzX10    = hz10;
-    if (hasU) lastUltraCm = ucm;
-    lastHasUltra = hasU;
-  } else {
-    haveLastReport = false;
-    lastHasUltra = false;
+/* ================== UI ================== */
+void showMenu() {
+  lcdClearCache();
+  lcdPrintLine(0, "Menu:");
+  for (uint8_t i=0; i<3; ++i) {
+    uint8_t idx = (menuIndex + i) % NUM_DEVICES;
+    char l[21];
+    snprintf(l, sizeof(l), "%c%-19s", (i==0 ? '>' : ' '), DEV_NAMES[idx]);
+    lcdPrintLine(i+1, l);
   }
+}
+
+void showProjectScreen() {
+  lcdClearCache();
+  char l0[21];
+  snprintf(l0, sizeof(l0), "%-12s (0x%02X)", currentName(), currentAddr());
+  lcdPrintLine(0, l0);
+
+  if (haveReport) {
+    char l1[21];
+    if (lastHasUltra) {
+      snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u U:%u",
+        (lastStatus & 0x01) ? "ON " : "OFF",
+        (unsigned)(lastHzX10/10), (unsigned)(lastHzX10%10),
+        (unsigned)lastUltraCm);
+    } else {
+      snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u       ",
+        (lastStatus & 0x01) ? "ON " : "OFF",
+        (unsigned)(lastHzX10/10), (unsigned)(lastHzX10%10));
+    }
+    lcdPrintLine(1, l1);
+
+    char l2[21];
+    snprintf(l2, sizeof(l2), "F:%2u.%02u L/m        ",
+      (unsigned)(lastFlowX100/100), (unsigned)(lastFlowX100%100));
+    lcdPrintLine(2, l2);
+  } else {
+    lcdPrintLine(1, "R:-- Hz:--.- U:---");
+    lcdPrintLine(2, "F:--.-- L/m       ");
+  }
+
+  lcdPrintLine(3, "Corto:ON/OFF Largo:Menu");
+}
+
+/* ================== Setup / Loop ================== */
+void setup() {
+  // I2C
+  Wire.begin();            // UNO como maestro
+  Wire.setClock(100000);   // 100kHz: seguro con LCD backpack
+  Wire.setTimeout(100);    // 100ms de timeout de bus
+
+  // LCD
+  lcd.init();
+  lcd.backlight();
+  lcdClearCache();
+
+  // Entradas
+  pinMode(BTN_PIN, INPUT_PULLUP);
+
+  Serial.begin(9600);
+  delay(80);
+
+  showMenu();
+}
+
+void loop() {
+  int y = readYAxisStable();
+
+  // Botón corto/largo
+  bool btnNow = digitalRead(BTN_PIN);
+  if (btnPrev == HIGH && btnNow == LOW) { btnDownAt = millis(); }
+  if (btnPrev == LOW && btnNow == HIGH) {
+    unsigned long held = millis() - btnDownAt;
+    if (inMenu) {
+      if (held >= 5) { // cualquier clic entra
+        inMenu = false;
+        haveReport = false;
+        lastHasUltra = false;
+        showProjectScreen();
+        // Hacer un primer intento inmediato
+        uint8_t st; uint16_t fx, hz, ucm; bool hu;
+        if (readReport(currentAddr(), st, fx, hz, ucm, hu)) {
+          haveReport   = true;
+          lastStatus   = st;
+          lastFlowX100 = fx;
+          lastHzX10    = hz;
+          lastHasUltra = hu;
+          if (hu) lastUltraCm = ucm;
+        } else {
+          haveReport   = false;
+          lastHasUltra = false;
+        }
+        showProjectScreen();
+        lastPollMs = millis();
+      }
+    } else {
+      if (held >= LONG_PRESS_MS) {
+        // LARGO: volver al menú (apagando el relé por seguridad)
+        sendRelay(currentAddr(), false);
+        inMenu = true;
+        showMenu();
+      } else {
+        // CORTO: toggle relé
+        bool desiredOn = haveReport ? ((lastStatus & 0x01) == 0) : true;
+        if (sendRelay(currentAddr(), desiredOn)) {
+          // Actualizar estado local por “optimismo”
+          if (desiredOn) lastStatus |= 0x01; else lastStatus &= ~0x01;
+          haveReport = true; // ya sabemos algo
+          showProjectScreen();
+        } else {
+          lcdPrintLine(2, "I2C error al enviar ");
+        }
+      }
+    }
+  }
+  btnPrev = btnNow;
+
+  // Navegación con autorepeat
+  if (inMenu) {
+    NavState ns = NAV_CENTER;
+    if (y < Y_LOW_THRESH) ns = NAV_UP;
+    else if (y > Y_HIGH_THRESH) ns = NAV_DOWN;
+
+    unsigned long now = millis();
+    if (ns != navState) {
+      navState = ns; navSince = now; navLastStep = 0;
+      if (navState == NAV_UP || navState == NAV_DOWN) {
+        int dir = (navState == NAV_UP) ? +1 : -1; // invierte si lo prefieres
+        menuIndex = (menuIndex + (dir > 0 ? 1 : -1) + NUM_DEVICES) % NUM_DEVICES;
+        showMenu(); navLastStep = now;
+      }
+    } else if (navState == NAV_UP || navState == NAV_DOWN) {
+      if ((now - navSince) >= NAV_INITIAL_DELAY && (now - navLastStep) >= NAV_REPEAT_INTERVAL) {
+        int dir = (navState == NAV_UP) ? +1 : -1;
+        menuIndex = (menuIndex + (dir > 0 ? 1 : -1) + NUM_DEVICES) % NUM_DEVICES;
+        showMenu(); navLastStep = now;
+      }
+    }
+  } else {
+    // En pantalla de proyecto: poll del reporte
+    unsigned long now = millis();
+    if (now - lastPollMs >= POLL_EVERY_MS) {
+      lastPollMs = now;
+
+      uint8_t st; uint16_t fx, hz, ucm; bool hu;
+      if (readReport(currentAddr(), st, fx, hz, ucm, hu)) {
+        haveReport   = true;
+        lastStatus   = st;
+        lastFlowX100 = fx;
+        lastHzX10    = hz;
+        if (hu) lastUltraCm = ucm;
+        lastHasUltra = hu;
+
+        // Redibujar filas variables
+        char l0[21];
+        snprintf(l0, sizeof(l0), "%-12s (0x%02X)", currentName(), currentAddr());
+        lcdPrintLine(0, l0);
+
+        char l1[21];
+        if (hu) {
+          snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u U:%u",
+            (st & 0x01) ? "ON " : "OFF",
+            (unsigned)(hz/10), (unsigned)(hz%10),
+            (unsigned)lastUltraCm);
+        } else {
+          snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u       ",
+            (st & 0x01) ? "ON " : "OFF",
+            (unsigned)(hz/10), (unsigned)(hz%10));
+        }
+        lcdPrintLine(1, l1);
+
+        char l2[21];
+        snprintf(l2, sizeof(l2), "F:%2u.%02u L/m        ",
+          (unsigned)(fx/100), (unsigned)(fx%100));
+        lcdPrintLine(2, l2);
+
+        lcdPrintLine(3, "Corto:ON/OFF Largo:Menu");
+      } else {
+        haveReport   = false;
+        lastHasUltra = false;
+        lcdPrintLine(1, "Sin respuesta I2C   ");
+        lcdPrintLine(2, "                    ");
+        lcdPrintLine(3, "Largo:Menu          ");
+        Serial.print(F("No responde 0x")); Serial.println(currentAddr(), HEX);
+      }
+    }
+  }
+
+  delay(8); // pequeña pausa antipolución del bus
 }
