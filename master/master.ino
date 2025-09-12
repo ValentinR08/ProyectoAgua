@@ -28,6 +28,7 @@ int  menuIndex  = 0;
 bool btnPrev    = HIGH;
 unsigned long btnDownAt = 0;
 const unsigned long LONG_PRESS_MS = 1000;
+const unsigned long DEBOUNCE_MS   = 50;
 
 /* ================== Poll I2C ================== */
 unsigned long lastPollMs = 0;
@@ -41,6 +42,8 @@ uint16_t lastFlowX100 = 0;       // L/min * 100
 uint16_t lastHzX10    = 0;       // Hz * 10
 uint16_t lastUltraCm  = 0;       // cm
 bool     lastHasUltra = false;
+// ⬇️ Nuevo: instante del último CM válido recibido (paquete de 8 bytes)
+unsigned long lastUltraOkMs = 0;
 
 /* ================== Autorepeat navegación ================== */
 enum NavState { NAV_CENTER, NAV_UP, NAV_DOWN };
@@ -104,13 +107,14 @@ bool readReport(uint8_t addr,
                 bool &hasUltra)
 {
   hasUltra = false;
+  ultraCm = 0; // Reseteo local por seguridad
 
-  // Pequeña separación para que el backpack del LCD no “acapare” el bus
-  delayMicroseconds(200);
+  // Pequeña separación para que el backpack del LCD no "acapare" el bus
+  delayMicroseconds(400); // ⬅️ antes 200
 
   // Intento #1: 8 bytes
   {
-    Wire.requestFrom((uint8_t)addr, (uint8_t)8, (uint8_t)true);
+    Wire.requestFrom((uint8_t)addr, (uint8_t)8);
     uint8_t got = Wire.available();
     if (got == 8) {
       uint8_t b0 = Wire.read(); (void)Wire.read();
@@ -122,18 +126,20 @@ bool readReport(uint8_t addr,
       hzX10    = (uint16_t)hL | ((uint16_t)hH << 8);
       ultraCm  = (uint16_t)uL | ((uint16_t)uH << 8);
       hasUltra = true;
-      // Limpieza por si quedaron bytes (no debería)
+
+      // 0xFFFF = sin eco → no mostrar CM
+      if (ultraCm == 0xFFFF) { hasUltra = false; ultraCm = 0; }
+
       while (Wire.available()) (void)Wire.read();
       return true;
     } else {
-      // Vaciar lo que haya
       while (Wire.available()) (void)Wire.read();
     }
   }
 
   // Intento #2: 6 bytes
   {
-    Wire.requestFrom((uint8_t)addr, (uint8_t)6, (uint8_t)true);
+    Wire.requestFrom((uint8_t)addr, (uint8_t)6);
     uint8_t got = Wire.available();
     if (got == 6) {
       uint8_t b0 = Wire.read(); (void)Wire.read();
@@ -144,6 +150,7 @@ bool readReport(uint8_t addr,
       hzX10    = (uint16_t)hL | ((uint16_t)hH << 8);
       ultraCm  = 0;
       hasUltra = false;
+
       while (Wire.available()) (void)Wire.read();
       return true;
     } else {
@@ -155,18 +162,11 @@ bool readReport(uint8_t addr,
 }
 
 bool sendRelay(uint8_t addr, bool on) {
-  // Separación para no colisionar con el LCD en el bus
-  delayMicroseconds(200);
-
+  delayMicroseconds(400); // ⬅️ antes 200
   Wire.beginTransmission(addr);
   Wire.write(on ? 1 : 0);
   uint8_t err = Wire.endTransmission(true);
-  if (err != 0) {
-    Serial.print(F("I2C endTransmission err=")); Serial.print(err);
-    Serial.print(F(" addr=0x")); Serial.println(addr, HEX);
-    return false;
-  }
-  return true;
+  return (err == 0);
 }
 
 /* ================== UI ================== */
@@ -190,12 +190,12 @@ void showProjectScreen() {
   if (haveReport) {
     char l1[21];
     if (lastHasUltra) {
-      snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u U:%u",
+      snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u CM:%u",
         (lastStatus & 0x01) ? "ON " : "OFF",
         (unsigned)(lastHzX10/10), (unsigned)(lastHzX10%10),
         (unsigned)lastUltraCm);
     } else {
-      snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u       ",
+      snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u CM:---",
         (lastStatus & 0x01) ? "ON " : "OFF",
         (unsigned)(lastHzX10/10), (unsigned)(lastHzX10%10));
     }
@@ -206,7 +206,7 @@ void showProjectScreen() {
       (unsigned)(lastFlowX100/100), (unsigned)(lastFlowX100%100));
     lcdPrintLine(2, l2);
   } else {
-    lcdPrintLine(1, "R:-- Hz:--.- U:---");
+    lcdPrintLine(1, "R:-- Hz:--.- CM:---");
     lcdPrintLine(2, "F:--.-- L/m       ");
   }
 
@@ -217,69 +217,72 @@ void showProjectScreen() {
 void setup() {
   // I2C
   Wire.begin();            // UNO como maestro
-  Wire.setClock(100000);   // 100kHz: seguro con LCD backpack
-  Wire.setTimeout(100);    // 100ms de timeout de bus
+  Wire.setClock(100000);   // 100kHz
+  Wire.setTimeout(200);    // 200ms
 
   // LCD
   lcd.init();
   lcd.backlight();
+
+  // Inicializar cache del LCD
+  for (uint8_t r=0; r<LCD_ROWS; ++r) {
+    for (uint8_t c=0; c<LCD_COLS; ++c) {
+      lineCache[r][c] = '\0';
+    }
+    lineCache[r][LCD_COLS] = '\0';
+  }
   lcdClearCache();
 
   // Entradas
   pinMode(BTN_PIN, INPUT_PULLUP);
 
-  Serial.begin(9600);
-  delay(80);
-
+  // Dibuja el menú al arrancar
   showMenu();
 }
 
 void loop() {
+  static unsigned long lastDebounceTime = 0;
   int y = readYAxisStable();
 
-  // Botón corto/largo
+  // Botón con debounce
   bool btnNow = digitalRead(BTN_PIN);
-  if (btnPrev == HIGH && btnNow == LOW) { btnDownAt = millis(); }
-  if (btnPrev == LOW && btnNow == HIGH) {
-    unsigned long held = millis() - btnDownAt;
+  unsigned long currentTime = millis();
+  
+  if (btnPrev == HIGH && btnNow == LOW) {
+    btnDownAt = currentTime;
+    lastDebounceTime = currentTime;
+  }
+  
+  if (btnPrev == LOW && btnNow == HIGH && (currentTime - lastDebounceTime) > DEBOUNCE_MS) {
+    unsigned long held = currentTime - btnDownAt;
+    
     if (inMenu) {
-      if (held >= 5) { // cualquier clic entra
+      if (held >= 50) { // Debounce aplicado
         inMenu = false;
-        haveReport = false;
+        haveReport   = false;
         lastHasUltra = false;
+        lastUltraCm  = 0;
+        navState = NAV_CENTER; // Reiniciar estado de navegación
         showProjectScreen();
-        // Hacer un primer intento inmediato
-        uint8_t st; uint16_t fx, hz, ucm; bool hu;
-        if (readReport(currentAddr(), st, fx, hz, ucm, hu)) {
-          haveReport   = true;
-          lastStatus   = st;
-          lastFlowX100 = fx;
-          lastHzX10    = hz;
-          lastHasUltra = hu;
-          if (hu) lastUltraCm = ucm;
-        } else {
-          haveReport   = false;
-          lastHasUltra = false;
-        }
-        showProjectScreen();
-        lastPollMs = millis();
+        lastPollMs = currentTime;
       }
     } else {
       if (held >= LONG_PRESS_MS) {
-        // LARGO: volver al menú (apagando el relé por seguridad)
         sendRelay(currentAddr(), false);
         inMenu = true;
+        navState = NAV_CENTER; // Reiniciar estado de navegación
         showMenu();
       } else {
-        // CORTO: toggle relé
         bool desiredOn = haveReport ? ((lastStatus & 0x01) == 0) : true;
         if (sendRelay(currentAddr(), desiredOn)) {
-          // Actualizar estado local por “optimismo”
           if (desiredOn) lastStatus |= 0x01; else lastStatus &= ~0x01;
-          haveReport = true; // ya sabemos algo
+          haveReport = true;
           showProjectScreen();
         } else {
-          lcdPrintLine(2, "I2C error al enviar ");
+          // Mensaje de error persistente
+          lcdPrintLine(3, "Error I2C al enviar  ");
+          delay(1000);
+          lcdPrintLine(3, "Corto:ON/OFF Largo:Menu");
         }
       }
     }
@@ -294,17 +297,22 @@ void loop() {
 
     unsigned long now = millis();
     if (ns != navState) {
-      navState = ns; navSince = now; navLastStep = 0;
+      navState = ns; 
+      navSince = now; 
+      navLastStep = 0;
+      
       if (navState == NAV_UP || navState == NAV_DOWN) {
-        int dir = (navState == NAV_UP) ? +1 : -1; // invierte si lo prefieres
-        menuIndex = (menuIndex + (dir > 0 ? 1 : -1) + NUM_DEVICES) % NUM_DEVICES;
-        showMenu(); navLastStep = now;
+        int dir = (navState == NAV_UP) ? +1 : -1;
+        menuIndex = (menuIndex + dir + NUM_DEVICES) % NUM_DEVICES;
+        showMenu(); 
+        navLastStep = now;
       }
     } else if (navState == NAV_UP || navState == NAV_DOWN) {
       if ((now - navSince) >= NAV_INITIAL_DELAY && (now - navLastStep) >= NAV_REPEAT_INTERVAL) {
         int dir = (navState == NAV_UP) ? +1 : -1;
-        menuIndex = (menuIndex + (dir > 0 ? 1 : -1) + NUM_DEVICES) % NUM_DEVICES;
-        showMenu(); navLastStep = now;
+        menuIndex = (menuIndex + dir + NUM_DEVICES) % NUM_DEVICES;
+        showMenu(); 
+        navLastStep = now;
       }
     }
   } else {
@@ -319,22 +327,29 @@ void loop() {
         lastStatus   = st;
         lastFlowX100 = fx;
         lastHzX10    = hz;
-        if (hu) lastUltraCm = ucm;
-        lastHasUltra = hu;
 
-        // Redibujar filas variables
-        char l0[21];
-        snprintf(l0, sizeof(l0), "%-12s (0x%02X)", currentName(), currentAddr());
-        lcdPrintLine(0, l0);
-
-        char l1[21];
+        unsigned long nowMs = millis();
         if (hu) {
-          snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u U:%u",
+          lastUltraCm   = ucm;
+          lastHasUltra  = true;
+          lastUltraOkMs = nowMs;              // recordatorio del último CM válido
+        } else {
+          // Mantener el último CM válido mientras no pasen 5 s sin uno nuevo
+          if (nowMs - lastUltraOkMs > 5000UL) {
+            lastHasUltra = false;             // >5 s sin CM válido -> mostrar ---
+          }
+          // Si no se excede el timeout, NO tocar lastUltraCm/lastHasUltra (se conserva)
+        }
+
+        // Actualizar solo las líneas que cambian
+        char l1[21];
+        if (lastHasUltra) {
+          snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u CM:%u",
             (st & 0x01) ? "ON " : "OFF",
             (unsigned)(hz/10), (unsigned)(hz%10),
             (unsigned)lastUltraCm);
         } else {
-          snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u       ",
+          snprintf(l1, sizeof(l1), "R:%s Hz:%u.%u CM:---",
             (st & 0x01) ? "ON " : "OFF",
             (unsigned)(hz/10), (unsigned)(hz%10));
         }
@@ -345,17 +360,15 @@ void loop() {
           (unsigned)(fx/100), (unsigned)(fx%100));
         lcdPrintLine(2, l2);
 
-        lcdPrintLine(3, "Corto:ON/OFF Largo:Menu");
       } else {
         haveReport   = false;
         lastHasUltra = false;
+        lastUltraCm  = 0;
         lcdPrintLine(1, "Sin respuesta I2C   ");
         lcdPrintLine(2, "                    ");
-        lcdPrintLine(3, "Largo:Menu          ");
-        Serial.print(F("No responde 0x")); Serial.println(currentAddr(), HEX);
       }
     }
   }
 
-  delay(8); // pequeña pausa antipolución del bus
+  delay(8); // Pequeña pausa para estabilidad
 }
